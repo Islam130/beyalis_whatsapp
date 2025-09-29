@@ -1,0 +1,33 @@
+{
+  "name": "whatsapp-app",
+  "version": "1.0.0",
+  "description": "WhatsApp session management with AWS S3, MySQL, and Baileys",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.891.0",
+    "@whiskeysockets/baileys": "7.0.0-rc.3",
+    "aws-sdk": "^2.1490.0",
+    "dotenv": "^17.2.2",
+    "express": "^4.21.2",
+    "mysql2": "^3.6.5",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "s3",
+    "mysql",
+    "nodejs"
+  ],
+  "author": "",
+  "license": "MIT"
+}
