@@ -1,6 +1,7 @@
 const { FSx } = require('aws-sdk');
 const mysql = require('mysql2/promise');
 const fs = require('fs');
+require('dotenv').config();
 
 // Database configuration
 const dbConfig = {
