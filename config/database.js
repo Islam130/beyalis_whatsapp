@@ -15,18 +15,6 @@ const dbConfig = {
 };
 
 // Validate database configuration
-if (!process.env.MYSQL_PASSWORD || process.env.MYSQL_PASSWORD === 'root@1234') {
-    console.log('⚠️  WARNING: Database password not configured!');
-    console.log('📝 Please create a .env file with your database credentials:');
-    console.log('');
-    console.log('DB_HOST=localhost');
-    console.log('DB_USER=root');
-    console.log('DB_PASSWORD=root@1234');
-    console.log('DB_NAME=mawared');
-    console.log('DB_PORT=3306');
-    console.log('');
-    console.log('💡 Or set the environment variables directly before running the bot.');
-}
 
 // Create connection pool
 const pool = mysql.createPool(dbConfig);
