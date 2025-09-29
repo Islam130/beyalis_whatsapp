@@ -4,18 +4,18 @@ const fs = require('fs');
 
 // Database configuration
 const dbConfig = {
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || 'root@1234',
-    database: process.env.DB_NAME || 'mawared',
-    port: process.env.DB_PORT || 3306,
+    host: process.env.MYSQL_HOST ,
+    user: process.env.MYSQL_USER ,
+    password: process.env.MYSQL_PASSWORD,
+    database: process.env.MYSQL_DATABASE,
+    port: process.env.PORT || 3306,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 };
 
 // Validate database configuration
-if (!process.env.DB_PASSWORD || process.env.DB_PASSWORD === 'root@1234') {
+if (!process.env.MYSQL_PASSWORD || process.env.MYSQL_PASSWORD === 'root@1234') {
     console.log('⚠️  WARNING: Database password not configured!');
     console.log('📝 Please create a .env file with your database credentials:');
     console.log('');
