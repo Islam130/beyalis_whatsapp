@@ -2431,7 +2431,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
             return;
         }
 
-        const chatId = message.key.remoteJid;
+        let chatId = message.key.remoteJid;
         const isGroup = chatId.endsWith('@g.us');
         
         // Extract sender information
@@ -2470,17 +2470,16 @@ async function storeMessageInDatabase(message, sock, sessionId) {
             if(message.key.fromMe){
                 const sessionData = await database.getDataSession(sessionId);
                 fromNumber = sessionData?.phone_number || 'unknown';
-                console.log('bgd a7a ')
                 console.log(sessionId)
                 console.log(fromNumber)
                 senderId = fromNumber;
                 // fs.writeFileSync('0.json', JSON.stringify(sessionData, null, 2));
             }
             else{
-                console.log("rrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
                 // fromNumber = message.key.remoteJidAlt.split('@')[0];
                 fromNumber = message.key.remoteJidAlt.split('@')[0] || message.key.senderPn?.split('@')[0];
                 senderId = fromNumber;
+                chatId = message?.key?.remoteJidAlt ?? message?.key?.senderPn;
                 // console.log('000000000000000000000000000000000000000000000')
                 // console.log(fromNumber)
             }
