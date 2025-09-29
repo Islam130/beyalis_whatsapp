@@ -2438,6 +2438,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
         let fromNumber = 'unknown';
         let senderId = 'unknown';
         let senderName = message.pushName || 'Unknown';
+        let messageStatus= 'sent'
 
         if (isGroup && message.key.participant) {
             try {
@@ -2480,6 +2481,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
                 fromNumber = message.key.remoteJidAlt.split('@')[0] || message.key.senderPn?.split('@')[0];
                 senderId = fromNumber;
                 chatId = message?.key?.remoteJidAlt ?? message?.key?.senderPn;
+                messageStatus='delivered'
                 // console.log('000000000000000000000000000000000000000000000')
                 // console.log(fromNumber)
             }
@@ -2535,7 +2537,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
             whatsappMessageId: message.key.id,
             mediaPreview: mediaPreview,
             parentId: message?.message?.extendedTextMessage?.contextInfo?.stanzaId || null, // For replies, extract from message
-            status: 'sent'
+            status: messageStatus
         };
 
         // Clean undefined values to prevent database errors
