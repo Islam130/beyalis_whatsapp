@@ -846,8 +846,8 @@ async function startWhatsAppForSession(sessionId) {
 
     // Store socket for this session
     sessionSockets.set(sessionId, sock);
-    fs.writeFileSync('011_.json', sock ? JSON.stringify(sessionId):JSON.stringify(0) );
-    fs.writeFileSync('010_.json', JSON.stringify(sessionSockets));
+    // fs.writeFileSync('011_.json', sock ? JSON.stringify(sessionId):JSON.stringify(0) );
+    // fs.writeFileSync('010_.json', JSON.stringify(sessionSockets));
     
     // Save credentials when updated
     sock.ev.on('creds.update', saveCreds);
