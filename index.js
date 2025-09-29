@@ -2481,7 +2481,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
                 fromNumber = message.key.remoteJidAlt.split('@')[0] || message.key.senderPn?.split('@')[0];
                 senderId = fromNumber;
                 chatId = message?.key?.remoteJidAlt ?? message?.key?.senderPn;
-                messageStatus='delivered'
+                // messageStatus='delivered'
                 // console.log('000000000000000000000000000000000000000000000')
                 // console.log(fromNumber)
             }
