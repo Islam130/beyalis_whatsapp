@@ -186,6 +186,108 @@ class Database {
         );
         return rows.length > 0;
     }
+
+    // Check if phone number already exists in sessions
+    async getSessionByPhoneNumber(phoneNumber) {
+        const [rows] = await this.pool.execute(
+            'SELECT * FROM sessions WHERE phone_number = ? ORDER BY id DESC LIMIT 1',
+            [phoneNumber]
+        );
+        return rows[0] || null;
+    }
+
+    // Migrate chats and messages from old session to new session
+    async migrateSessionData(oldSessionId, newSessionId) {
+        console.log(`🔄 Migrating data from session ${oldSessionId} to ${newSessionId}`);
+
+        const connection = await this.pool.getConnection();
+        try {
+            await connection.beginTransaction();
+
+            // Update all chats to point to new session
+            const [chatsResult] = await connection.execute(
+                'UPDATE chats SET session_id = ? WHERE session_id = ?',
+                [newSessionId, oldSessionId]
+            );
+            console.log(`   ✅ Migrated ${chatsResult.affectedRows} chats`);
+
+            // Update all messages to point to new session
+            const [messagesResult] = await connection.execute(
+                'UPDATE messages SET session_id = ? WHERE session_id = ?',
+                [newSessionId, oldSessionId]
+            );
+            console.log(`   ✅ Migrated ${messagesResult.affectedRows} messages`);
+
+            // Delete old session
+            await connection.execute(
+                'DELETE FROM sessions WHERE id = ?',
+                [oldSessionId]
+            );
+            console.log(`   ✅ Deleted old session ${oldSessionId}`);
+
+            await connection.commit();
+            console.log(`✅ Migration completed successfully`);
+
+            return {
+                migratedChats: chatsResult.affectedRows,
+                migratedMessages: messagesResult.affectedRows
+            };
+        } catch (error) {
+            await connection.rollback();
+            console.error(`❌ Error during migration:`, error);
+            throw error;
+        } finally {
+            connection.release();
+        }
+    }
+
+    // Search for chat by phone number (handles both @s.whatsapp.net and @lid)
+    // Supports phone_number stored as JSON array or string
+    async getChatByPhoneNumber(phoneNumber, sessionId) {
+        // Clean the phone number
+        const cleanPhone = phoneNumber.replace(/\D/g, '');
+
+        // Try exact match first (for @s.whatsapp.net)
+        const exactJid = `${cleanPhone}@s.whatsapp.net`;
+
+        // Query that handles both JSON array and string storage
+        const [rows] = await this.pool.execute(
+            `SELECT * FROM chats
+             WHERE session_id = ?
+             AND (
+                 id = ?
+                 OR phone_number = ?
+                 OR JSON_CONTAINS(phone_number, ?, '$')
+                 OR JSON_SEARCH(phone_number, 'one', ?, NULL, '$') IS NOT NULL
+                 OR phone_number LIKE ?
+             )
+             LIMIT 1`,
+            [sessionId, exactJid, cleanPhone, `"${cleanPhone}"`, cleanPhone, `%${cleanPhone}%`]
+        );
+
+        return rows[0] || null;
+    }
+
+    // Get all chats for a session (with phone number filtering)
+    // Supports phone_number stored as JSON array or string
+    async searchChatsByPhone(phoneNumber, sessionId) {
+        const cleanPhone = phoneNumber.replace(/\D/g, '');
+
+        const [rows] = await this.pool.execute(
+            `SELECT * FROM chats
+             WHERE session_id = ?
+             AND (
+                 phone_number = ?
+                 OR JSON_CONTAINS(phone_number, ?, '$')
+                 OR JSON_SEARCH(phone_number, 'one', ?, NULL, '$') IS NOT NULL
+                 OR phone_number LIKE ?
+                 OR id LIKE ?
+             )
+             ORDER BY last_message_timestamp DESC`,
+            [sessionId, cleanPhone, `"${cleanPhone}"`, cleanPhone, `%${cleanPhone}%`, `%${cleanPhone}%`]
+        );
+        return rows;
+    }
 }
 
 module.exports = new Database();

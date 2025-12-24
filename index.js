@@ -1,4 +1,5 @@
-const { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage, makeInMemoryStore } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const fs = require('fs');
@@ -9,6 +10,7 @@ const express = require('express');
 const database = require('./config/database');
 const s3Service = require('./services/s3Service');
 const sessionManager = require('./services/sessionManager');
+const phoneResolver = require('./utils/phoneResolver');
 const { log } = require('console');
 
 // Create Express app
@@ -18,10 +20,10 @@ const PORT = 3001;
 // Middleware
 app.use(express.json());
 
-// Store current QR code globally
-let currentQRCode = null;
-
-// Store sockets by session ID
+// Runtime storage for active WebSocket connections
+// Note: This Map is REQUIRED - WebSocket connections cannot be stored in database
+// Database (sessions table) stores: id, phone_number, qr, ready status (persistent data)
+// This Map stores: live socket objects with sendMessage(), event listeners, etc. (runtime only)
 const sessionSockets = new Map();
 
 // Track last sync time for message recovery
@@ -139,9 +141,20 @@ app.post('/session', async (req, res) => {
         
     } catch (error) {
         console.error('Error creating session:', error);
+        
+        // Provide more specific error messages
+        let errorMessage = 'Internal server error';
+        if (error.message.includes('Failed to create auth directory')) {
+            errorMessage = 'Failed to create authentication directory. Please check file permissions.';
+        } else if (error.message.includes('ENOENT')) {
+            errorMessage = 'File system error: Directory not found or permission denied.';
+        } else if (error.message.includes('database')) {
+            errorMessage = 'Database error occurred while creating session.';
+        }
+        
         res.status(500).json({
             success: false,
-            message: 'Internal server error',
+            message: errorMessage,
             error: error.message
         });
     }
@@ -222,11 +235,22 @@ app.post('/session/:id/send-text', async (req, res) => {
             const chatId = sessionManager.generateChatId(toJid, sessionId);
             const whatsappMessageId = result?.key?.id || `temp_${Date.now()}`;
 
+            // Try to get contact name from WhatsApp
+            let contactName = toJid.split('@')[0]; // Default to phone number
+            try {
+                const [contact] = await sock.onWhatsApp(toJid);
+                if (contact && contact.notify) {
+                    contactName = contact.notify;
+                }
+            } catch (err) {
+                console.log(`⚠️ Could not fetch contact name for ${toJid}, using phone number`);
+            }
+
             await database.createOrUpdateChat({
                 id: chatId,
                 sessionId,
-                name: toJid.split('@')[0],
-                phoneNumber: toJid.split('@')[0],
+                name: contactName,
+                phoneNumber: JSON.stringify([toJid.split('@')[0]]),
                 isGroup: toJid.endsWith('@g.us') ? 1 : 0,
                 lastMessageId: whatsappMessageId,
                 lastMessageTimestamp: Math.floor(Date.now() / 1000)
@@ -682,6 +706,123 @@ app.post('/session/:id/update-qr', async (req, res) => {
     }
 });
 
+// Endpoint to manually trigger history sync for a session
+app.post('/session/:sessionId/sync-history', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { daysBack } = req.body; // Optional: how many days of history to sync
+
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`🔄 MANUAL HISTORY SYNC TRIGGERED for session ${sessionId}`);
+        console.log(`${'='.repeat(60)}`);
+
+        // Get session data
+        const session = await database.getSession(sessionId);
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        if (!session.ready) {
+            return res.status(400).json({
+                success: false,
+                message: 'Session is not ready. Please scan QR code first.'
+            });
+        }
+
+        // Get socket for this session
+        const sock = sessionSockets.get(parseInt(sessionId));
+        if (!sock) {
+            return res.status(400).json({
+                success: false,
+                message: 'Session socket not connected. Try restoring the session first.'
+            });
+        }
+
+        // Request history sync from WhatsApp
+        console.log('📡 Requesting history sync from WhatsApp...');
+
+        // The history sync happens automatically through messaging-history.set event
+        // We can trigger a reconnection to force a fresh sync
+        try {
+            // Get current chats from store
+            const chats = sock.store?.chats ? Object.values(sock.store.chats) : [];
+            const contacts = sock.store?.contacts ? Object.values(sock.store.contacts) : [];
+
+            console.log(`📊 Current store state: ${chats.length} chats, ${contacts.length} contacts`);
+
+            // Fetch messages for each chat
+            let totalMessagesSynced = 0;
+            let totalChatsSynced = 0;
+
+            for (const chat of chats) {
+                try {
+                    // Store chat in database
+                    await storeChatInDatabase(chat, sock, sessionId);
+                    totalChatsSynced++;
+
+                    // Try to fetch messages for this chat
+                    // Note: This may not work for all message types depending on WhatsApp's sync state
+                    const messages = sock.store?.messages?.[chat.id];
+                    if (messages) {
+                        const messageArray = Object.values(messages);
+                        console.log(`📨 Found ${messageArray.length} messages in ${chat.id}`);
+
+                        for (const message of messageArray) {
+                            try {
+                                // Check if message exists
+                                const existingMessage = await database.getMessage(message.key?.id);
+                                if (!existingMessage) {
+                                    await storeHistorySyncMessage(message, sock, sessionId, contacts);
+                                    totalMessagesSynced++;
+                                }
+                            } catch (msgError) {
+                                console.error(`❌ Error syncing message:`, msgError.message);
+                            }
+                        }
+                    }
+                } catch (chatError) {
+                    console.error(`❌ Error syncing chat ${chat.id}:`, chatError.message);
+                }
+            }
+
+            console.log(`\n${'='.repeat(60)}`);
+            console.log(`✅ MANUAL HISTORY SYNC COMPLETED`);
+            console.log(`📂 Chats synced: ${totalChatsSynced}`);
+            console.log(`📨 Messages synced: ${totalMessagesSynced}`);
+            console.log(`${'='.repeat(60)}\n`);
+
+            res.json({
+                success: true,
+                message: 'History sync completed',
+                sessionId: sessionId,
+                stats: {
+                    chatsSynced: totalChatsSynced,
+                    messagesSynced: totalMessagesSynced
+                }
+            });
+
+        } catch (syncError) {
+            console.error('❌ Error during history sync:', syncError);
+            res.status(500).json({
+                success: false,
+                message: 'Error during history sync',
+                error: syncError.message
+            });
+        }
+
+    } catch (error) {
+        console.error('Error triggering history sync:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
 // Endpoint to manually restore all ready sessions
 app.post('/restore-sessions', async (req, res) => {
     try {
@@ -827,22 +968,204 @@ app.get('/debug/session/:id/qr', async (req, res) => {
     }
 });
 
+// Endpoint to search for chat by phone number (handles @lid and regular accounts)
+app.get('/session/:sessionId/chat/search', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { phone } = req.query;
+
+        if (!phone) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number is required (use ?phone=XXXXXXXXXX)'
+            });
+        }
+
+        console.log(`🔍 Searching for chat with phone: ${phone} in session ${sessionId}`);
+
+        // Use the phoneResolver utility to find the chat
+        const chat = await phoneResolver.findChatByPhone(database, phone, sessionId);
+
+        if (!chat) {
+            return res.status(404).json({
+                success: false,
+                message: 'Chat not found for this phone number',
+                searchedPhone: phone
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Chat found',
+            chat: {
+                id: chat.id,
+                sessionId: chat.session_id,
+                name: chat.name,
+                phoneNumber: chat.phone_number,
+                isGroup: chat.is_group,
+                lastMessageTimestamp: chat.last_message_timestamp,
+                isBusinessAccount: phoneResolver.isBusinessAccount(chat.id),
+                isRegularAccount: phoneResolver.isRegularAccount(chat.id)
+            }
+        });
+
+    } catch (error) {
+        console.error('Error searching chat by phone:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+// Endpoint to send message by phone number (auto-resolves @lid)
+app.post('/session/:sessionId/send-by-phone', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { phone, text } = req.body;
+
+        if (!phone || !text) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number and text are required'
+            });
+        }
+
+        // Get socket for this session
+        const sock = sessionSockets.get(parseInt(sessionId));
+        if (!sock) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found or not connected'
+            });
+        }
+
+        console.log(`📤 Sending message to phone ${phone} in session ${sessionId}`);
+
+        // Convert phone to proper JID (handles @lid resolution)
+        const jid = await phoneResolver.phoneToJid(sock, phone);
+        console.log(`✅ Resolved phone ${phone} to JID: ${jid}`);
+
+        // Send the message
+        const result = await sock.sendMessage(jid, { text });
+
+        res.json({
+            success: true,
+            message: 'Message sent successfully',
+            sentTo: {
+                phone,
+                jid,
+                isBusinessAccount: phoneResolver.isBusinessAccount(jid),
+                isRegularAccount: phoneResolver.isRegularAccount(jid)
+            },
+            messageId: result?.key?.id
+        });
+
+    } catch (error) {
+        console.error('Error sending message by phone:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to send message',
+            error: error.message
+        });
+    }
+});
+
+// Endpoint to resolve phone number to JID (useful for testing)
+app.get('/session/:sessionId/resolve-phone', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { phone } = req.query;
+
+        if (!phone) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number is required (use ?phone=XXXXXXXXXX)'
+            });
+        }
+
+        // Get socket for this session
+        const sock = sessionSockets.get(parseInt(sessionId));
+        if (!sock) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found or not connected'
+            });
+        }
+
+        console.log(`🔄 Resolving phone ${phone} to JID in session ${sessionId}`);
+
+        // Resolve phone to JID
+        const jid = await phoneResolver.phoneToJid(sock, phone);
+
+        res.json({
+            success: true,
+            phone,
+            jid,
+            accountType: phoneResolver.isBusinessAccount(jid) ? 'Business (@lid)' :
+                        phoneResolver.isRegularAccount(jid) ? 'Regular (@s.whatsapp.net)' :
+                        'Unknown'
+        });
+
+    } catch (error) {
+        console.error('Error resolving phone:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to resolve phone number',
+            error: error.message
+        });
+    }
+});
+
 // Function to start WhatsApp for a specific session
 async function startWhatsAppForSession(sessionId) {
     console.log(`🚀 Starting WhatsApp connection for session: ${sessionId}`);
-    
+
     // Use multi-file auth state for persistent sessions (session-specific)
     const authDir = `auth_info_baileys_${sessionId}`;
+
+    // Ensure the auth directory exists before using it
+    try {
+        if (!fs.existsSync(authDir)) {
+            console.log(`📁 Creating auth directory: ${authDir}`);
+            fs.mkdirSync(authDir, { recursive: true });
+            console.log(`✅ Auth directory created: ${authDir}`);
+        }
+    } catch (error) {
+        console.error(`❌ Error creating auth directory ${authDir}:`, error);
+        throw new Error(`Failed to create auth directory: ${error.message}`);
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    
+
+    // Create in-memory store for this session to cache messages/chats during runtime
+    // Note: This is a runtime cache, not persistent storage - DB is the source of truth
+    const store = makeInMemoryStore({
+        logger: pino({ level: 'silent' })
+    });
+
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false, // Don't print QR in terminal for multiple sessions
         defaultQueryTimeoutMs: 60000,
         syncFullHistory: true,
         shouldSyncHistoryMessage: () => true,
-        syncSessionMessages: true
+        getMessage: async (key) => {
+            // Required for history sync - get message from store
+            if (store) {
+                const msg = await store.loadMessage(key.remoteJid, key.id);
+                return msg?.message || undefined;
+            }
+            return undefined;
+        }
     });
+
+    // Bind store to socket events (required for history sync to work)
+    store.bind(sock.ev);
+
+    // Attach store to socket for easy access (no separate Map needed)
+    sock.store = store;
 
     // Store socket for this session
     sessionSockets.set(sessionId, sock);
@@ -887,16 +1210,31 @@ async function startWhatsAppForSession(sessionId) {
         
         if (connection === 'open') {
             console.log(`✅ WhatsApp connection opened successfully for session ${sessionId}!`);
-            
+
             // Update session in database: set ready = true, store phone number, clear QR code
             try {
                 const phoneNumber = sock.user?.id?.split(':')[0] || 'unknown';
+
+                // Check if this phone number already exists in sessions table
+                const existingSession = await database.getSessionByPhoneNumber(phoneNumber);
+
+                if (existingSession && existingSession.id !== sessionId) {
+                    console.log(`⚠️ Phone number ${phoneNumber} already exists in session ${existingSession.id}`);
+                    console.log(`🔄 Migrating data from old session ${existingSession.id} to new session ${sessionId}`);
+
+                    // Migrate all chats and messages from old session to new session
+                    const migrationResult = await database.migrateSessionData(existingSession.id, sessionId);
+
+                    console.log(`✅ Migration completed: ${migrationResult.migratedChats} chats, ${migrationResult.migratedMessages} messages`);
+                }
+
+                // Update the new session as ready
                 await database.updateSessionReady(sessionId, phoneNumber);
                 console.log(`📱 Session ${sessionId} ready for phone: ${phoneNumber}`);
             } catch (error) {
                 console.error(`❌ Error marking session ${sessionId} as ready:`, error.message);
             }
-            
+
             // Set up message listeners for this session
             setupMessageListeners(sock, sessionId);
         }
@@ -964,93 +1302,81 @@ async function startWhatsAppForSession(sessionId) {
 
     // Listen for messaging history sync
     sock.ev.on('messaging-history.set', async ({ chats, contacts, messages, syncType }) => {
-        console.log("now messaging-history.set")
         return;
-        console.log(`⚡ History Sync Event Triggered for session ${sessionId}!`);
-        console.log('Sync Type:', syncType);
-        console.log('Chats count:', chats.length);
-        console.log('Contacts count:', contacts.length);
-        console.log('Messages count:', messages.length);
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`⚡ HISTORY SYNC EVENT for session ${sessionId}`);
+        console.log(`${'='.repeat(60)}`);
+        console.log(`📊 Sync Type: ${syncType}`);
+        console.log(`💬 Chats received: ${chats?.length || 0}`);
+        console.log(`👥 Contacts received: ${contacts?.length || 0}`);
+        console.log(`📨 Messages received: ${messages?.length || 0}`);
+        console.log(`${'='.repeat(60)}\n`);
 
-        // Process in background to avoid blocking the main connection
+        // Process history sync in background to avoid blocking
         setImmediate(async () => {
             try {
+                let storedChats = 0;
+                let storedMessages = 0;
+                let skippedMessages = 0;
+
                 // Store synced chats in database
-                let index=0;
+                console.log(`📂 Processing ${chats?.length || 0} chats...`);
+                for (const chat of (chats || [])) {
+                    try {
+                        await storeChatInDatabase(chat, sock, sessionId);
+                        storedChats++;
+                    } catch (error) {
+                        console.error(`❌ Error storing synced chat ${chat.id}:`, error.message);
+                    }
+                }
+                console.log(`✅ Stored ${storedChats} chats`);
 
-                for (const chat of chats) {
-                    index=index+1;
-                    if(index<=20){
+                // Store synced messages in database
+                console.log(`📨 Processing ${messages?.length || 0} messages...`);
+
+                // Process messages in batches to avoid overwhelming the database
+                const batchSize = 50;
+                const messageArray = messages || [];
+
+                for (let i = 0; i < messageArray.length; i += batchSize) {
+                    const batch = messageArray.slice(i, i + batchSize);
+
+                    for (const message of batch) {
                         try {
-                            // fs.writeFileSync('0'+index+'.json', JSON.stringify(chat));
-                        } catch (fileError) {
-                            console.error(`❌ Error writing chat file ${index}:`, fileError.message);
+                            // Check if message already exists in database to avoid duplicates
+                            const existingMessage = await database.getMessage(message.key?.id);
+                            if (existingMessage) {
+                                skippedMessages++;
+                                continue;
+                            }
+
+                            // Ensure chat exists before storing message
+                            await ensureChatExists(message, sock, sessionId);
+
+                            // Store message with history sync context
+                            await storeHistorySyncMessage(message, sock, sessionId, contacts);
+                            storedMessages++;
+                        } catch (error) {
+                            console.error(`❌ Error storing synced message ${message.key?.id}:`, error.message);
                         }
                     }
-                    try {
-                        // await storeChatInDatabase(chat, sock, sessionId);
-                    } catch (error) {
-                        console.error(`❌ Error storing synced chat ${chat.id}:`, error);
+
+                    // Log progress for large syncs
+                    if (messageArray.length > batchSize) {
+                        const progress = Math.min(i + batchSize, messageArray.length);
+                        console.log(`📊 Progress: ${progress}/${messageArray.length} messages processed`);
                     }
                 }
 
-                // Store synced messages in database (skip recent messages to avoid duplicates)
-                const currentTime = Date.now();
-                const fiveMinutesAgo = currentTime - (5 * 60 * 1000); // 5 minutes ago
-                let index2=0;
-                for (const message of messages) {
-                    index2=index2+1;
-                    if(index2<=20){
-                        try {
-                            // fs.writeFileSync('00'+index+'.json', JSON.stringify(message));
-                        } catch (fileError) {
-                            console.error(`❌ Error writing message file ${index2}:`, fileError.message);
-                        }
-                    }
-                    try {
-                        // Skip messages that are very recent (likely already processed by messages.upsert)
-                        const messageTime = Number(message.messageTimestamp) * 1000; // Convert to milliseconds
-                        // if (messageTime > fiveMinutesAgo) {
-                        //     console.log(`⏭️ Skipping recent message ${message.key.id} from history sync (already processed)`);
-                        //     continue;
-                        // }
-                        let msg=message
-                        const remoteJid = msg?.key?.remoteJid; // Fixed: use message.key, not message.message.key
-                        const fromMe = msg?.key?.fromMe;
+                console.log(`\n${'='.repeat(60)}`);
+                console.log(`✅ HISTORY SYNC COMPLETED for session ${sessionId}`);
+                console.log(`📂 Chats stored: ${storedChats}`);
+                console.log(`📨 Messages stored: ${storedMessages}`);
+                console.log(`⏭️ Messages skipped (duplicates): ${skippedMessages}`);
+                console.log(`${'='.repeat(60)}\n`);
 
-                        // Phone number
-                        let phoneNumber = null;
-                        if (remoteJid?.endsWith('@s.whatsapp.net')) {
-                            phoneNumber = remoteJid.split('@')[0]; // normal user
-                        } else if (remoteJid?.endsWith('@lid')) {
-                            phoneNumber = remoteJid.split('@')[0]; // business multi-device lid
-                        } else if (remoteJid?.endsWith('@g.us')) {
-                            phoneNumber = remoteJid; // group
-                        }
-
-                        // Find contact name from `contacts` array (NO network calls to prevent timeout)
-                        const contact = contacts.find(c => c.id === remoteJid);
-                        
-                        const name = contact?.name || contact?.notify || phoneNumber;
-
-                        console.log('reeeeeeeeeeeeeeeeesssssssssssssuuuulllllllt')
-
-                        console.log(JSON.stringify({
-                            remoteJid: remoteJid,
-                            phoneNumber: phoneNumber,
-                            contactName: name,
-                            fromMe: fromMe
-                        }));
-
-                       // await storeMessageInDatabase(message, sock, sessionId);
-                    } catch (error) {
-                        console.error(`❌ Error storing synced message ${message.key?.id}:`, error);
-                    }
-                }
-
-                console.log(`✅ History sync completed and stored in database for session ${sessionId}`);
             } catch (error) {
-                console.error(`❌ Error in background history sync processing:`, error.message);
+                console.error(`❌ Error in history sync processing:`, error.message);
             }
         });
     });
@@ -2126,22 +2452,19 @@ async function ensureChatExists(message, sock, sessionId) {
                 phoneNumbers = [chatId.split('@')[0]];
             }
         } else {
-            // For individual chats
-            chatName =chatId.split('@')[0] ||  message.pushName ;
+            // For individual chats - get contact name from message or use phone as fallback
+            chatName = message.pushName || message.verifiedBizName || chatId.split('@')[0];
             phoneNumbers = [chatId.split('@')[0]];
         }
 
-        // Create chat data
+        // Create chat data - store as proper JSON array
         let phoneNumberString;
         if (isGroup) {
-            // For groups, store first 3 numbers to fit in VARCHAR(255)
-            phoneNumberString = phoneNumbers.slice(0, 3).join(',');
-            phoneNumberString = '['+phoneNumberString+']';
-    
+            // For groups, store all participant phone numbers as JSON array
+            phoneNumberString = JSON.stringify(phoneNumbers);
         } else {
-            // For individual chats, store just the one number
-            phoneNumberString = phoneNumbers[0] || 'unknown';
-            phoneNumberString = '['+phoneNumberString+']';
+            // For individual chats, store as JSON array with single phone
+            phoneNumberString = JSON.stringify([phoneNumbers[0] || 'unknown']);
         }
 
         const chatData = {
@@ -2177,9 +2500,11 @@ async function storeChatInDatabase(chat, sock, sessionId) {
         const isGroup = chat.id.endsWith('@g.us');
         const isSinge = chat.id.endsWith('s.whatsapp.net');
         let phoneNumbers = [];
-        let chatName = chat.name || chat.subject || 'Unknown';
+        let chatName = 'Unknown';
 
         if (isGroup) {
+            // For groups, use subject or name
+            chatName = chat.subject || chat.name || 'Unknown Group';
             // For groups, get all participant phone numbers
             try {
                 const groupMetadata = await sock.groupMetadata(chat.id);
@@ -2195,6 +2520,9 @@ async function storeChatInDatabase(chat, sock, sessionId) {
                 phoneNumbers = [chat.id.split('@')[0]];
             }
         } else {
+            // For individual chats, try to get contact name
+            chatName = chat.name || chat.notify || chat.verifiedName || chat.id.split('@')[0];
+
             // For individual chats, get the other person's number
             phoneNumbers = [chat.id.split('@')[0]];
         }
@@ -2203,13 +2531,11 @@ async function storeChatInDatabase(chat, sock, sessionId) {
         // For groups, store the first few numbers (due to VARCHAR(255) limit)
         let phoneNumberString;
         if (isGroup) {
-            // For groups, store first 3 numbers to fit in VARCHAR(255)
-            phoneNumberString = phoneNumbers.slice(0, 3).join(',');
-            phoneNumberString = '['+phoneNumberString+']';
+            // For groups, store first 3 numbers as JSON array
+            phoneNumberString = JSON.stringify(phoneNumbers.slice(0, 3));
         } else {
-            // For individual chats, store just the one number
-            phoneNumberString = phoneNumbers[0] || 'unknown';
-            phoneNumberString = '['+phoneNumbers[0]+']';
+            // For individual chats, store just the one number as JSON array
+            phoneNumberString = JSON.stringify([phoneNumbers[0] || 'unknown']);
         }
     
 
@@ -2573,6 +2899,114 @@ async function storeMessageInDatabase(message, sock, sessionId) {
         
         // Don't throw error to prevent bot crash
         console.log('💡 Bot will continue without storing this message');
+    }
+}
+
+// Helper function to store message from history sync (without media upload to avoid timeouts)
+async function storeHistorySyncMessage(message, sock, sessionId, contacts = []) {
+    try {
+        if (!sessionId) {
+            console.log('⚠️ No session ID provided for storing history sync message');
+            return;
+        }
+
+        let chatId = message.key?.remoteJid || message.key?.remoteJidAlt;
+        if (!chatId) {
+            console.log('⚠️ No chat ID found in message');
+            return;
+        }
+
+        const isGroup = chatId.endsWith('@g.us');
+
+        // Extract sender information
+        let fromNumber = 'unknown';
+        let senderId = 'unknown';
+        let senderName = message.pushName || 'Unknown';
+
+        if (isGroup && message.key.participant) {
+            // For groups, use participant info
+            fromNumber = message.key.participant.split('@')[0];
+            senderId = fromNumber;
+
+            // Try to get name from contacts array (avoid network calls during history sync)
+            const contact = contacts.find(c => c.id === message.key.participant);
+            if (contact) {
+                senderName = contact.name || contact.notify || senderName;
+            }
+        } else if (!isGroup) {
+            if (message.key.fromMe) {
+                // Message sent by us
+                const sessionData = await database.getDataSession(sessionId);
+                fromNumber = sessionData?.phone_number || 'unknown';
+                senderId = fromNumber;
+            } else {
+                // Message received from someone else
+                const remoteJidAlt = message.key.remoteJidAlt || message.key.senderPn;
+                fromNumber = remoteJidAlt ? remoteJidAlt.split('@')[0] : chatId.split('@')[0];
+                senderId = fromNumber;
+
+                // Update chatId if we have alternate JID
+                if (remoteJidAlt) {
+                    chatId = remoteJidAlt;
+                }
+
+                // Try to get name from contacts array
+                const contact = contacts.find(c => c.id === message.key.remoteJid || c.id === remoteJidAlt);
+                if (contact) {
+                    senderName = contact.name || contact.notify || senderName;
+                }
+            }
+        }
+
+        // Extract message content
+        const body = s3Service.extractTextContent(message) || '';
+        const mediaType = s3Service.getMediaType(message);
+        const hasMedia = mediaType ? 1 : 0;
+
+        // For history sync, we don't upload media to S3 to avoid timeouts
+        // Media can be fetched on-demand later
+        let mediaPreview = null;
+        if (hasMedia) {
+            // Store a placeholder indicating media exists but wasn't uploaded during sync
+            mediaPreview = `history_sync_media_${mediaType}`;
+        }
+
+        const messageData = {
+            id: message.key.id,
+            chatId: sessionManager.generateChatId(chatId, sessionId),
+            sessionId: sessionId,
+            fromNumber: fromNumber,
+            senderId: senderId,
+            senderName: senderName,
+            body: body,
+            timestamp: Number(message.messageTimestamp),
+            fromMe: message.key.fromMe ? 1 : 0,
+            hasMedia: hasMedia,
+            mediaType: mediaType,
+            whatsappMessageId: message.key.id,
+            mediaPreview: mediaPreview,
+            parentId: message?.message?.extendedTextMessage?.contextInfo?.stanzaId || null,
+            status: message.key.fromMe ? 'sent' : 'delivered'
+        };
+
+        // Clean undefined values
+        const cleanMessageData = {};
+        for (const [key, value] of Object.entries(messageData)) {
+            cleanMessageData[key] = value === undefined ? null : value;
+        }
+
+        await database.createMessage(cleanMessageData);
+
+        // Update chat's last message info
+        try {
+            await updateChatLastMessage(chatId, message.key.id, Number(message.messageTimestamp), sessionId);
+        } catch (error) {
+            // Silent fail for last message update
+        }
+
+    } catch (error) {
+        console.error('❌ Error storing history sync message:', error.message);
+        throw error;
     }
 }
 
