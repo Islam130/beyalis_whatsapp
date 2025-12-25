@@ -1,4 +1,4 @@
-const { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage, makeInMemoryStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
@@ -19,6 +19,7 @@ const PORT = 3001;
 
 // Middleware
 app.use(express.json());
+// Root endpoint - health checkapp.get('/', (req, res) => {    res.json({ status: 'success', message: 'WhatsApp Bot Server is running' });});
 
 // Runtime storage for active WebSocket connections
 // Note: This Map is REQUIRED - WebSocket connections cannot be stored in database
@@ -235,15 +236,44 @@ app.post('/session/:id/send-text', async (req, res) => {
             const chatId = sessionManager.generateChatId(toJid, sessionId);
             const whatsappMessageId = result?.key?.id || `temp_${Date.now()}`;
 
-            // Try to get contact name from WhatsApp
+            // Try to get WhatsApp profile name of recipient - try multiple methods
             let contactName = toJid.split('@')[0]; // Default to phone number
+            
             try {
-                const [contact] = await sock.onWhatsApp(toJid);
-                if (contact && contact.notify) {
+                // Method 1: Check stored contacts first
+                const contacts = sock.store?.contacts || {};
+                const contact = contacts[toJid];
+                if (contact?.name) {
+                    contactName = contact.name;
+                } else if (contact?.notify) {
                     contactName = contact.notify;
                 }
             } catch (err) {
-                console.log(`⚠️ Could not fetch contact name for ${toJid}, using phone number`);
+                // Continue to next method
+            }
+            
+            // Method 2: If still not found, try onWhatsApp
+            if (contactName === toJid.split('@')[0]) {
+                try {
+                    const [waContact] = await sock.onWhatsApp(toJid);
+                    if (waContact?.notify) {
+                        contactName = waContact.notify;
+                    }
+                } catch (err) {
+                    // Continue to next method
+                }
+            }
+            
+            // Method 3: Check database for existing chat with this contact
+            if (contactName === toJid.split('@')[0]) {
+                try {
+                    const existingChat = await database.getChatByPhoneNumber(toJid.split('@')[0], sessionId);
+                    if (existingChat?.name && existingChat.name !== toJid.split('@')[0]) {
+                        contactName = existingChat.name;
+                    }
+                } catch (err) {
+                    // Use phone number as fallback
+                }
             }
 
             await database.createOrUpdateChat({
@@ -1118,8 +1148,37 @@ app.get('/session/:sessionId/resolve-phone', async (req, res) => {
     }
 });
 
+// Function to clear sync state files to force fresh history sync
+// This mimics what happens when you close and reopen WhatsApp Web browser
+function clearSyncState(authDir) {
+    try {
+        if (!fs.existsSync(authDir)) {
+            return;
+        }
+
+        const files = fs.readdirSync(authDir);
+        let cleared = 0;
+
+        for (const file of files) {
+            // Delete app-state-sync files (these track what data has been synced)
+            // Keep: creds.json, pre-key-*.json, sender-key-*.json, session-*.json
+            if (file.startsWith('app-state-sync-')) {
+                const filePath = path.join(authDir, file);
+                fs.unlinkSync(filePath);
+                cleared++;
+            }
+        }
+
+        if (cleared > 0) {
+            console.log(`🔄 Cleared ${cleared} sync state files to force fresh history sync`);
+        }
+    } catch (error) {
+        console.log(`⚠️ Could not clear sync state: ${error.message}`);
+    }
+}
+
 // Function to start WhatsApp for a specific session
-async function startWhatsAppForSession(sessionId) {
+async function startWhatsAppForSession(sessionId, forceHistorySync = false) {
     console.log(`🚀 Starting WhatsApp connection for session: ${sessionId}`);
 
     // Use multi-file auth state for persistent sessions (session-specific)
@@ -1137,13 +1196,12 @@ async function startWhatsAppForSession(sessionId) {
         throw new Error(`Failed to create auth directory: ${error.message}`);
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    // Clear sync state to force WhatsApp to send history (like closing/reopening browser)
+    if (forceHistorySync) {
+        clearSyncState(authDir);
+    }
 
-    // Create in-memory store for this session to cache messages/chats during runtime
-    // Note: This is a runtime cache, not persistent storage - DB is the source of truth
-    const store = makeInMemoryStore({
-        logger: pino({ level: 'silent' })
-    });
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     const sock = makeWASocket({
         auth: state,
@@ -1151,21 +1209,18 @@ async function startWhatsAppForSession(sessionId) {
         defaultQueryTimeoutMs: 60000,
         syncFullHistory: true,
         shouldSyncHistoryMessage: () => true,
+        // CRITICAL: Prevent automatic logout on connection issues
+        connectTimeoutMs: 120000, // 2 minutes timeout instead of default
+        keepAliveIntervalMs: 30000, // Send keep-alive every 30 seconds to prevent idle timeout
+        retryRequestDelayMs: 6000, // Increase retry delay
+        reconnectDelayStart: 500,
+        reconnectDelayMax: 20000,
+        maxRetries: 10, // Increase retry attempts
         getMessage: async (key) => {
-            // Required for history sync - get message from store
-            if (store) {
-                const msg = await store.loadMessage(key.remoteJid, key.id);
-                return msg?.message || undefined;
-            }
+            // Message lookup for retry purposes
             return undefined;
         }
     });
-
-    // Bind store to socket events (required for history sync to work)
-    store.bind(sock.ev);
-
-    // Attach store to socket for easy access (no separate Map needed)
-    sock.store = store;
 
     // Store socket for this session
     sessionSockets.set(sessionId, sock);
@@ -1231,56 +1286,130 @@ async function startWhatsAppForSession(sessionId) {
                 // Update the new session as ready
                 await database.updateSessionReady(sessionId, phoneNumber);
                 console.log(`📱 Session ${sessionId} ready for phone: ${phoneNumber}`);
+                
+                // Verify saved data in database
+                console.log(`\n${'='.repeat(60)}`);
+                console.log(`📚 DATA PERSISTENCE CHECK`);
+                console.log(`${'='.repeat(60)}`);
+                
+                try {
+                    // Get all chats for this session
+                    const [chats] = await database.pool.execute(
+                        'SELECT COUNT(*) as count FROM chats WHERE session_id = ?',
+                        [sessionId]
+                    );
+                    const chatCount = chats[0].count;
+                    
+                    // Get all messages for this session
+                    const [messages] = await database.pool.execute(
+                        'SELECT COUNT(*) as count FROM messages WHERE session_id = ?',
+                        [sessionId]
+                    );
+                    const messageCount = messages[0].count;
+                    
+                    console.log(`✅ Saved data for session ${sessionId}:`);
+                    console.log(`   📂 Chats: ${chatCount}`);
+                    console.log(`   📨 Messages: ${messageCount}`);
+                    console.log(`   💾 Data is persisted and will be recovered if you logout and login again`);
+                    console.log(`${'='.repeat(60)}\n`);
+                } catch (error) {
+                    console.log(`⚠️ Could not verify saved data: ${error.message}`);
+                }
+
+                // Sync any missed messages that arrived while server was down
+                console.log(`\n📬 Checking for missed messages...`);
+                await syncMissedMessages(sock, sessionId);
+                
+                // Set up message listeners for this session
+                setupMessageListeners(sock, sessionId);
+                
             } catch (error) {
                 console.error(`❌ Error marking session ${sessionId} as ready:`, error.message);
             }
-
-            // Set up message listeners for this session
-            setupMessageListeners(sock, sessionId);
         }
         
         if (connection === 'close') {
             console.log(`❌ Connection closed for session ${sessionId}`);
             
-            // Update session status to not ready
-            try {
-                await database.pool.execute(
-                    'UPDATE sessions SET ready = 0, updated_at = NOW() WHERE id = ?',
-                    [sessionId]
-                );
-            } catch (error) {
-                console.error(`❌ Error updating session status for ${sessionId}:`, error.message);
-            }
+            // DO NOT mark session as not ready - keep session ready to enable reconnection
+            // This prevents the "session not ready" error when reconnecting
             
             // Check the disconnect reason
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             
             if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
                 console.log(`🚫 Session ${sessionId} logged out - not attempting reconnection`);
-                // Remove socket from map
-                // sessionSockets.delete(sessionId);
+                
+                // CLEANUP: Stop keep-alive interval and remove socket from map
+                if (sock.keepAliveInterval) {
+                    clearInterval(sock.keepAliveInterval);
+                    console.log(`🛑 Stopped keep-alive interval for session ${sessionId}`);
+                }
+                sessionSockets.delete(sessionId);
+                console.log(`🗑️ Removed socket for session ${sessionId} from active connections`);
+                
+                // Mark session as not ready in database
+                try {
+                    await database.pool.execute(
+                        'UPDATE sessions SET ready = 0, updated_at = NOW() WHERE id = ?',
+                        [sessionId]
+                    );
+                    console.log(`✅ Session ${sessionId} marked as not ready in database`);
+                } catch (error) {
+                    console.error(`❌ Error updating session status for ${sessionId}:`, error.message);
+                }
                 return;
             }
             
-            // For all other errors, attempt reconnection
+            // For all other errors (network issues, temporary disconnects), attempt reconnection WITHOUT marking ready=0
             if (shouldReconnect) {
-                console.log(`🔄 Attempting to reconnect session ${sessionId} in 5 seconds...`);
+                console.log(`🔄 Connection lost for session ${sessionId} - attempting to reconnect in 3 seconds...`);
+                console.log(`📌 Session remains ready in database to maintain connection state`);
                 setTimeout(() => {
                     startWhatsAppForSession(sessionId);
-                }, 5000);
-            } else {
-                // Remove socket from map if not reconnecting
-                // sessionSockets.delete(sessionId);
+                }, 3000);
             }
         }
     });
 
+    // KEEP-ALIVE MECHANISM: Prevent idle timeout by querying connection every 60 seconds
+    // This keeps the WebSocket alive and prevents automatic logout
+    const keepAliveInterval = setInterval(async () => {
+        try {
+            // Check if session still exists and is active in database
+            const session = await database.getSession(sessionId);
+            
+            if (!session || !session.ready) {
+                console.log(`⚠️ Session ${sessionId} no longer active - stopping keep-alive ping`);
+                clearInterval(keepAliveInterval);
+                sessionSockets.delete(sessionId);
+                return;
+            }
+            
+            if (sock.user) {
+                console.log(`💚 Keep-alive ping for session ${sessionId}`);
+                // Query chats list to keep connection active
+                await sock.fetchPrivacySettings().catch(() => null);
+            }
+        } catch (error) {
+            // Silently handle keep-alive errors
+            console.log(`⚠️  Keep-alive ping failed for session ${sessionId}: ${error.message}`);
+        }
+    }, 60000); // Every 60 seconds
 
-    // Listen for messages
+    // Store interval ID for cleanup if needed
+    sock.keepAliveInterval = keepAliveInterval;
+
+    // Listen for messages (both real-time and history/offline)
     sock.ev.on('messages.upsert', async (messageUpdate) => {
         const { messages, type } = messageUpdate;
 
-        if (type === 'notify') {
+        // Handle both 'notify' (real-time) and 'append' (history/offline) messages
+        if (type === 'notify' || type === 'append') {
+            if (type === 'append') {
+                console.log(`📥 Received ${messages.length} offline/history messages`);
+            }
+
             for (const message of messages) {
                 // fs.writeFileSync('0.json', JSON.stringify(message));
                 // First, ensure the chat exists in database
@@ -1297,6 +1426,10 @@ async function startWhatsAppForSession(sessionId) {
                     console.error(`❌ Error storing message ${message.key.id}:`, error);
                 }
             }
+
+            if (type === 'append') {
+                console.log(`✅ Stored ${messages.length} offline/history messages`);
+            }
         }
     });
 
@@ -1310,6 +1443,20 @@ async function startWhatsAppForSession(sessionId) {
         console.log(`💬 Chats received: ${chats?.length || 0}`);
         console.log(`👥 Contacts received: ${contacts?.length || 0}`);
         console.log(`📨 Messages received: ${messages?.length || 0}`);
+
+        // Get the latest message timestamp from database to sync only new messages
+        // This allows syncing messages that arrived while the server was down
+        let syncFromDate = 0;
+        try {
+            const [latestMsg] = await database.pool.execute(
+                'SELECT MAX(timestamp) as latest FROM messages WHERE session_id = ?',
+                [sessionId]
+            );
+            syncFromDate = latestMsg[0]?.latest || 0;
+            console.log(`📅 Syncing messages newer than: ${syncFromDate ? new Date(syncFromDate * 1000).toLocaleString() : 'all messages (first sync)'}`);
+        } catch (err) {
+            console.log(`⚠️ Could not get latest message timestamp, will sync all messages`);
+        }
         console.log(`${'='.repeat(60)}\n`);
 
         // Process history sync in background to avoid blocking
@@ -1318,11 +1465,36 @@ async function startWhatsAppForSession(sessionId) {
                 let storedChats = 0;
                 let storedMessages = 0;
                 let skippedMessages = 0;
+                let skippedOldMessages = 0;
 
-                // Store synced chats in database
+                // Build a contacts map for faster lookup (id -> contact object)
+                const contactsMap = new Map();
+                for (const contact of (contacts || [])) {
+                    if (contact.id) {
+                        contactsMap.set(contact.id, contact);
+                    }
+                }
+                console.log(`📇 Built contacts map with ${contactsMap.size} entries`);
+
+                // Store synced chats in database with contact names
                 console.log(`📂 Processing ${chats?.length || 0} chats...`);
                 for (const chat of (chats || [])) {
                     try {
+                        // Enrich chat with contact name if available
+                        const isGroup = chat.id.endsWith('@g.us');
+                        if (!isGroup && !chat.name && !chat.notify) {
+                            // Try to get name from contacts map
+                            const contact = contactsMap.get(chat.id);
+                            if (contact) {
+                                if (contact.name) {
+                                    chat.name = contact.name;
+                                } else if (contact.notify) {
+                                    chat.notify = contact.notify;
+                                } else if (contact.verifiedName) {
+                                    chat.verifiedName = contact.verifiedName;
+                                }
+                            }
+                        }
                         await storeChatInDatabase(chat, sock, sessionId);
                         storedChats++;
                     } catch (error) {
@@ -1338,11 +1510,21 @@ async function startWhatsAppForSession(sessionId) {
                 const batchSize = 50;
                 const messageArray = messages || [];
 
+                // Convert contacts array to the format expected by storeHistorySyncMessage
+                const contactsArray = Array.from(contactsMap.values());
+
                 for (let i = 0; i < messageArray.length; i += batchSize) {
                     const batch = messageArray.slice(i, i + batchSize);
 
                     for (const message of batch) {
                         try {
+                            // Skip messages older than sync date
+                            const messageTimestamp = Number(message.messageTimestamp) || 0;
+                            if (messageTimestamp < syncFromDate) {
+                                skippedOldMessages++;
+                                continue;
+                            }
+
                             // Check if message already exists in database to avoid duplicates
                             const existingMessage = await database.getMessage(message.key?.id);
                             if (existingMessage) {
@@ -1353,8 +1535,8 @@ async function startWhatsAppForSession(sessionId) {
                             // Ensure chat exists before storing message
                             await ensureChatExists(message, sock, sessionId);
 
-                            // Store message with history sync context
-                            await storeHistorySyncMessage(message, sock, sessionId, contacts);
+                            // Store message with history sync context (pass contacts array)
+                            await storeHistorySyncMessage(message, sock, sessionId, contactsArray);
                             storedMessages++;
                         } catch (error) {
                             console.error(`❌ Error storing synced message ${message.key?.id}:`, error.message);
@@ -1373,7 +1555,9 @@ async function startWhatsAppForSession(sessionId) {
                 console.log(`📂 Chats stored: ${storedChats}`);
                 console.log(`📨 Messages stored: ${storedMessages}`);
                 console.log(`⏭️ Messages skipped (duplicates): ${skippedMessages}`);
+                console.log(`🔙 Messages skipped (older than ${new Date(syncFromDate * 1000).toLocaleDateString()}): ${skippedOldMessages}`);
                 console.log(`${'='.repeat(60)}\n`);
+                console.log(`💾 All messages have been saved to database for persistence across logout/login`);
 
             } catch (error) {
                 console.error(`❌ Error in history sync processing:`, error.message);
@@ -1573,6 +1757,140 @@ function setupMessageListeners(sock, sessionId) {
     });
 }
 
+// Function to sync missed messages from all chats after reconnection
+async function syncMissedMessages(sock, sessionId) {
+    try {
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`📬 SYNCING MISSED MESSAGES for session ${sessionId}`);
+        console.log(`${'='.repeat(60)}`);
+        
+        // Wait a moment for WhatsApp store to populate
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Get all chats from WhatsApp store
+        const chats = sock.store?.chats ? Object.values(sock.store.chats) : [];
+        console.log(`📂 Found ${chats.length} chats to sync messages from`);
+        
+        let totalMissedMessages = 0;
+        
+        for (const chat of chats) {
+            try {
+                // Get messages for this chat from WhatsApp store
+                const messages = sock.store?.messages?.[chat.id] || {};
+                const messageArray = Object.values(messages);
+                
+                if (messageArray.length === 0) continue;
+                
+                console.log(`\n📱 Chat: ${chat.name || chat.id} (${messageArray.length} messages)`);
+                
+                // Get the latest message timestamp from database for this chat
+                const [latestDbMessage] = await database.pool.execute(
+                    `SELECT MAX(timestamp) as lastTimestamp FROM messages 
+                     WHERE chat_id = (SELECT id FROM chats WHERE phone_number = ? AND session_id = ?)`,
+                    [chat.id.split('@')[0], sessionId]
+                );
+                
+                const lastSyncTimestamp = latestDbMessage[0]?.lastTimestamp ? 
+                    new Date(latestDbMessage[0].lastTimestamp).getTime() / 1000 : 0;
+                
+                console.log(`   📅 Last synced message timestamp: ${lastSyncTimestamp}`);
+                
+                // Filter messages newer than the last synced message
+                const newMessages = messageArray.filter(msg => {
+                    const msgTime = Number(msg.messageTimestamp) || 0;
+                    return msgTime > lastSyncTimestamp;
+                });
+                
+                if (newMessages.length > 0) {
+                    console.log(`   ⭐ Found ${newMessages.length} new/missed messages to store`);
+                    
+                    // Store each missed message
+                    for (const message of newMessages) {
+                        try {
+                            // Check if message already exists
+                            const existingMsg = await database.getMessage(message.key?.id);
+                            if (!existingMsg) {
+                                await ensureChatExists(message, sock, sessionId);
+                                await storeMessageInDatabase(message, sock, sessionId);
+                                totalMissedMessages++;
+                            }
+                        } catch (error) {
+                            console.error(`   ❌ Error storing message ${message.key?.id}:`, error.message);
+                        }
+                    }
+                    
+                    console.log(`   ✅ Stored ${newMessages.length} missed messages`);
+                } else {
+                    console.log(`   ✓ No new messages since last sync`);
+                }
+            } catch (error) {
+                console.error(`❌ Error processing chat ${chat.id}:`, error.message);
+            }
+        }
+        
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`✅ MISSED MESSAGE SYNC COMPLETED`);
+        console.log(`   📬 Total new messages stored: ${totalMissedMessages}`);
+        console.log(`${'='.repeat(60)}\n`);
+        
+        return totalMissedMessages;
+        
+    } catch (error) {
+        console.error(`❌ Error during missed message sync:`, error.message);
+        return 0;
+    }
+}
+
+// Helper function to safely terminate a session and cleanup resources
+async function terminateSession(sessionId) {
+    try {
+        console.log(`\n🛑 TERMINATING SESSION ${sessionId}`);
+        console.log('='.repeat(60));
+        
+        // Get socket for this session
+        const sock = sessionSockets.get(sessionId);
+        
+        if (sock) {
+            // Stop keep-alive interval
+            if (sock.keepAliveInterval) {
+                clearInterval(sock.keepAliveInterval);
+                console.log(`✅ Stopped keep-alive interval for session ${sessionId}`);
+            }
+            
+            // Close WebSocket connection gracefully
+            try {
+                await sock.ws?.close();
+                console.log(`✅ Closed WebSocket connection for session ${sessionId}`);
+            } catch (error) {
+                console.log(`⚠️ Error closing WebSocket: ${error.message}`);
+            }
+            
+            // Remove socket from active connections map
+            sessionSockets.delete(sessionId);
+            console.log(`✅ Removed socket from active connections`);
+        } else {
+            console.log(`⚠️ Socket not found in active connections`);
+        }
+        
+        // Update database to mark session as not ready
+        try {
+            await database.pool.execute(
+                'UPDATE sessions SET ready = 0, updated_at = NOW() WHERE id = ?',
+                [sessionId]
+            );
+            console.log(`✅ Marked session as not ready in database`);
+        } catch (error) {
+            console.error(`❌ Error updating database: ${error.message}`);
+        }
+        
+        console.log('='.repeat(60));
+        console.log(`✅ SESSION ${sessionId} TERMINATED AND CLEANED UP\n`);
+        
+    } catch (error) {
+        console.error(`❌ Error terminating session ${sessionId}:`, error.message);
+    }
+}
+
 async function startWhatsApp() {
     // Use multi-file auth state for persistent sessions
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -1596,7 +1914,14 @@ async function startWhatsApp() {
         defaultQueryTimeoutMs: 60000,
         syncFullHistory:true,
         shouldSyncHistoryMessage: () => true,
-        syncSessionMessages :true
+        syncSessionMessages :true,
+        // CRITICAL: Prevent automatic logout on connection issues
+        connectTimeoutMs: 120000,
+        keepAliveIntervalMs: 30000,
+        retryRequestDelayMs: 6000,
+        reconnectDelayStart: 500,
+        reconnectDelayMax: 20000,
+        maxRetries: 10
     });
     
     // Note: This function is deprecated - use startWhatsAppForSession for multi-session support
@@ -1897,49 +2222,73 @@ async function startWhatsApp() {
                 isFirstConnection = false;
             }
             
-            // Trigger messaging-history.set event to sync all data
-            console.log('🔄 Triggering messaging-history.set event...');
-            try {
-                // Manually trigger the history sync by calling the event handler
-                const chats = Object.values(sock.store?.chats || {});
-                const contacts = Object.values(sock.store?.contacts || {});
-                const messages = Object.values(sock.store?.messages || {});
-                
-                // Flatten messages from all chats
-                const allMessages = [];
-                for (const chatId in sock.store?.messages || {}) {
-                    const chatMessages = Object.values(sock.store.messages[chatId] || {});
-                    allMessages.push(...chatMessages);
-                }
-                
-                console.log(`📊 Found ${chats.length} chats, ${contacts.length} contacts, ${allMessages.length} messages`);
-                
-                // Call the messaging-history.set event handler manually
-                await sock.ev.emit('messaging-history.set', {
-                    chats: chats,
-                    contacts: contacts,
-                    messages: allMessages,
-                    syncType: 'manual_trigger'
-                });
+            // History sync will be triggered automatically by WhatsApp through messaging-history.set event
+            // This happens because syncFullHistory: true and shouldSyncHistoryMessage: () => true are set
+            console.log('📡 Waiting for automatic history sync from WhatsApp...');
 
-                console.log("now messaging-history.set")
-                return;
-                
-                console.log('✅ Messaging history sync triggered successfully');
-            } catch (error) {
-                console.error('❌ Error triggering messaging-history.set:', error);
-            }
-            
             // Update last sync time
             lastSyncTime = Date.now();
-            
+
             // Get initial chat count
             getChatCounts(sock);
-            
-            // Show initial message tracker status
-            setTimeout(() => {
+
+            // Manually trigger history fetch for chats that need syncing
+            // This is a fallback for when automatic sync doesn't provide all messages
+            setTimeout(async () => {
                 console.log('📊 Message status tracking is active');
-            }, 2000);
+
+                // Fetch history for existing chats from database
+                try {
+                    console.log(`\n${'='.repeat(60)}`);
+                    console.log(`🔄 MANUAL HISTORY SYNC for session ${sessionId}`);
+                    console.log(`${'='.repeat(60)}`);
+
+                    // Get all chats for this session from database
+                    const [dbChats] = await database.pool.execute(
+                        'SELECT id, name, last_message_timestamp FROM chats WHERE session_id = ? ORDER BY last_message_timestamp DESC LIMIT 50',
+                        [sessionId]
+                    );
+
+                    console.log(`📂 Found ${dbChats.length} chats in database to sync`);
+
+                    let syncedChats = 0;
+                    for (const chat of dbChats) {
+                        try {
+                            // Get the oldest message we have for this chat
+                            const [oldestMsg] = await database.pool.execute(
+                                'SELECT id, timestamp FROM messages WHERE chat_id = ? AND session_id = ? ORDER BY timestamp ASC LIMIT 1',
+                                [chat.id, sessionId]
+                            );
+
+                            if (oldestMsg.length > 0) {
+                                // Request messages older than what we have
+                                const msgKey = {
+                                    remoteJid: chat.id,
+                                    id: oldestMsg[0].id,
+                                    fromMe: false
+                                };
+
+                                console.log(`   📨 Fetching history for: ${chat.name || chat.id}`);
+
+                                // Use fetchMessageHistory to get more messages
+                                await sock.fetchMessageHistory(50, msgKey, oldestMsg[0].timestamp);
+                                syncedChats++;
+
+                                // Small delay to avoid rate limiting
+                                await new Promise(resolve => setTimeout(resolve, 500));
+                            }
+                        } catch (chatError) {
+                            // Silent fail for individual chats
+                            console.log(`   ⚠️ Could not sync ${chat.name || chat.id}: ${chatError.message}`);
+                        }
+                    }
+
+                    console.log(`✅ Manual history sync requested for ${syncedChats} chats`);
+                    console.log(`${'='.repeat(60)}\n`);
+                } catch (error) {
+                    console.log(`⚠️ Manual history sync skipped: ${error.message}`);
+                }
+            }, 5000); // Wait 5 seconds for automatic sync to complete first
         }
     });
 
@@ -2099,7 +2448,10 @@ let messageStatusUpdateCount = 0;
         console.log('typeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
         console.log(type);
         
-        if (type === 'notify') {
+        if (type === 'notify' || type === 'append') {
+            if (type === 'append') {
+                console.log();
+            }
             let inx=0;
             for (const message of messages) {
                 // First, ensure the chat exists in database
@@ -2426,11 +2778,13 @@ async function ensureChatExists(message, sock, sessionId) {
         }
 
         // Check if chat already exists in database
-        const existingChat = await database.getChat(sessionManager.generateChatId(chatId,sessionId), sessionId);
-        if (existingChat) {
-            console.log(`✅ Chat already exists in database: ${chatId}`);
-            return;
-        }
+        // const existingChat = await database.getChat(sessionManager.generateChatId(chatId,sessionId), sessionId);
+        // fs.writeFileSync('islam.txt', JSON.stringify(existingChat, null, 2));
+        // if (existingChat) {
+            // console.log(`✅ Chat already exists in database: ${chatId}`);
+            // existingChat.name
+            // return;
+        // }
 
         // Create a basic chat object from the chatId
         const isGroup = chatId.endsWith('@g.us');
@@ -2452,8 +2806,61 @@ async function ensureChatExists(message, sock, sessionId) {
                 phoneNumbers = [chatId.split('@')[0]];
             }
         } else {
-            // For individual chats - get contact name from message or use phone as fallback
-            chatName = message.pushName || message.verifiedBizName || chatId.split('@')[0];
+            // For individual chats - get WhatsApp profile name (highest priority)
+            try {
+                if (message.key.fromMe) {
+                    // For outgoing messages (sent by us), get recipient's WhatsApp profile name
+                    const phoneNum = chatId.split('@')[0];
+                    
+                    // Try to get WhatsApp profile name - try multiple methods
+                    let profileName = null;
+                    
+                    try {
+                        // Method 1: Check stored contacts
+                        const contacts = sock.store?.contacts || {};
+                        const contact = contacts[chatId];
+                        if (contact?.name) {
+                            profileName = contact.name;
+                        } else if (contact?.notify) {
+                            profileName = contact.notify;
+                        }
+                    } catch (err) {
+                        // Continue to next method
+                    }
+                    
+                    // Method 2: Try to get from onWhatsApp
+                    if (!profileName) {
+                        try {
+                            const [waContact] = await sock.onWhatsApp(chatId);
+                            if (waContact?.notify) {
+                                profileName = waContact.notify;
+                            }
+                        } catch (err) {
+                            // Continue
+                        }
+                    }
+                    
+                    // Method 3: Check database for existing chat with this contact
+                    if (!profileName) {
+                        try {
+                            const existingChat = await database.getChatByPhoneNumber(phoneNum, sessionId);
+                            if (existingChat?.name && existingChat.name !== phoneNum) {
+                                profileName = existingChat.name;
+                            }
+                        } catch (err) {
+                            // Continue
+                        }
+                    }
+                    
+                    chatName = profileName || phoneNum;
+                } else {
+                    // For incoming messages, use sender's pushName (their WhatsApp profile name)
+                    chatName = message.pushName || message.verifiedBizName || chatId.split('@')[0];
+                }
+            } catch (error) {
+                // Fallback to phone number if anything goes wrong
+                chatName = chatId.split('@')[0];
+            }
             phoneNumbers = [chatId.split('@')[0]];
         }
 
@@ -2520,8 +2927,43 @@ async function storeChatInDatabase(chat, sock, sessionId) {
                 phoneNumbers = [chat.id.split('@')[0]];
             }
         } else {
-            // For individual chats, try to get contact name
-            chatName = chat.name || chat.notify || chat.verifiedName || chat.id.split('@')[0];
+            // For individual chats, try to get contact name from multiple sources
+            // Priority: 1. chat.name, 2. chat.notify, 3. chat.verifiedName, 4. socket contacts, 5. onWhatsApp lookup
+            chatName = chat.name || chat.notify || chat.verifiedName || null;
+
+            // If no name found, try to get from socket contacts
+            if (!chatName) {
+                try {
+                    const contacts = sock.store?.contacts || {};
+                    const contact = contacts[chat.id];
+                    if (contact?.name) {
+                        chatName = contact.name;
+                    } else if (contact?.notify) {
+                        chatName = contact.notify;
+                    } else if (contact?.verifiedName) {
+                        chatName = contact.verifiedName;
+                    }
+                } catch (err) {
+                    console.log(`⚠️ Could not get contact from store for ${chat.id}`);
+                }
+            }
+
+            // If still no name, try onWhatsApp lookup to get profile name
+            if (!chatName && sock) {
+                try {
+                    const [waContact] = await sock.onWhatsApp(chat.id);
+                    if (waContact?.notify) {
+                        chatName = waContact.notify;
+                    }
+                } catch (err) {
+                    console.log(`⚠️ Could not get profile name via onWhatsApp for ${chat.id}`);
+                }
+            }
+
+            // Final fallback to phone number
+            if (!chatName) {
+                chatName = chat.id.split('@')[0];
+            }
 
             // For individual chats, get the other person's number
             phoneNumbers = [chat.id.split('@')[0]];
@@ -2763,7 +3205,7 @@ async function storeMessageInDatabase(message, sock, sessionId) {
         // Extract sender information
         let fromNumber = 'unknown';
         let senderId = 'unknown';
-        let senderName = message.pushName || 'Unknown';
+        let senderName = 'Unknown';  // Default, will be overridden
         let messageStatus= 'sent'
 
         if (isGroup && message.key.participant) {
@@ -2781,16 +3223,21 @@ async function storeMessageInDatabase(message, sock, sessionId) {
                         fromNumber = message.key.participant.split('@')[0];
                         senderId = fromNumber;
                     }
+                    
+                    // Get sender name from participant metadata
+                    senderName = senderParticipant.name || senderParticipant.verifiedName || message.pushName || fromNumber;
                 } else {
                     // Fallback if participant not found
                     fromNumber = message.key.participant.split('@')[0];
                     senderId = fromNumber;
+                    senderName = message.pushName || fromNumber;
                 }
             } catch (error) {
                 console.error('❌ Error getting group metadata for message:', error.message);
                 // Fallback to basic extraction
                 fromNumber = message.key.participant.split('@')[0];
                 senderId = fromNumber;
+                senderName = message.pushName || fromNumber;
             }
         }
         else if (!isGroup) {
@@ -2800,13 +3247,47 @@ async function storeMessageInDatabase(message, sock, sessionId) {
                 console.log(sessionId)
                 console.log(fromNumber)
                 senderId = fromNumber;
+                senderName = 'You';  // Message sent by user
+                senderName = message.pushName || 'YOU' ;
                 // fs.writeFileSync('0.json', JSON.stringify(sessionData, null, 2));
             }
             else{
-                // fromNumber = message.key.remoteJidAlt.split('@')[0];
-                fromNumber = message.key.remoteJidAlt.split('@')[0] || message.key.senderPn?.split('@')[0];
+                // Extract phone number from remoteJidAlt or senderPn with proper null checks
+                if (message.key.remoteJidAlt) {
+                    fromNumber = message.key.remoteJidAlt.split('@')[0];
+                    chatId = message.key.remoteJidAlt;
+                } else if (message.key.senderPn) {
+                    fromNumber = message.key.senderPn.split('@')[0];
+                    chatId = message.key.senderPn;
+                } else {
+                    // Fallback to remoteJid if neither is available
+                    fromNumber = message.key.remoteJid.split('@')[0];
+                    chatId = message.key.remoteJid;
+                }
                 senderId = fromNumber;
-                chatId = message?.key?.remoteJidAlt ?? message?.key?.senderPn;
+                
+                // Get sender name from WhatsApp profile
+                // Try multiple sources in order of preference
+                if (message.pushName) {
+                    senderName = message.pushName;
+                } else if (message.verifiedBizName) {
+                    senderName = message.verifiedBizName;
+                } else {
+                    // Try to get from socket contacts
+                    try {
+                        const contacts = sock.store?.contacts || {};
+                        const contact = contacts[chatId];
+                        if (contact?.name) {
+                            senderName = contact.name;
+                        } else if (contact?.notify) {
+                            senderName = contact.notify;
+                        } else {
+                            senderName = fromNumber;  // Fallback to phone number
+                        }
+                    } catch (err) {
+                        senderName = fromNumber;
+                    }
+                }
                 // messageStatus='delivered'
                 // console.log('000000000000000000000000000000000000000000000')
                 // console.log(fromNumber)
@@ -2921,17 +3402,61 @@ async function storeHistorySyncMessage(message, sock, sessionId, contacts = []) 
         // Extract sender information
         let fromNumber = 'unknown';
         let senderId = 'unknown';
-        let senderName = message.pushName || 'Unknown';
+        let senderName = 'Unknown';  // Default to Unknown, will be overridden
 
         if (isGroup && message.key.participant) {
             // For groups, use participant info
             fromNumber = message.key.participant.split('@')[0];
             senderId = fromNumber;
 
-            // Try to get name from contacts array (avoid network calls during history sync)
-            const contact = contacts.find(c => c.id === message.key.participant);
-            if (contact) {
-                senderName = contact.name || contact.notify || senderName;
+            // Try multiple sources to get sender name
+            // 1. First check message.pushName (most reliable for history sync)
+            if (message.pushName) {
+                senderName = message.pushName;
+            }
+            // 2. Try contacts array from history sync
+            if (senderName === 'Unknown') {
+                const contact = contacts.find(c => c.id === message.key.participant);
+                if (contact?.name) {
+                    senderName = contact.name;
+                } else if (contact?.notify) {
+                    senderName = contact.notify;
+                }
+            }
+            // 3. Try groupMetadata to get participant info (like storeMessageInDatabase)
+            if (senderName === 'Unknown' && sock) {
+                try {
+                    const groupMetadata = await sock.groupMetadata(chatId);
+                    const senderParticipant = groupMetadata.participants.find(
+                        obj => obj.id === message.key.participant
+                    );
+                    if (senderParticipant) {
+                        if (senderParticipant.name) {
+                            senderName = senderParticipant.name;
+                        } else if (senderParticipant.verifiedName) {
+                            senderName = senderParticipant.verifiedName;
+                        } else if (senderParticipant.notify) {
+                            senderName = senderParticipant.notify;
+                        }
+                    }
+                } catch (err) {
+                    // Group metadata not available, continue with fallback
+                }
+            }
+            // 4. Try onWhatsApp lookup for profile name
+            if (senderName === 'Unknown' && sock) {
+                try {
+                    const [waContact] = await sock.onWhatsApp(message.key.participant);
+                    if (waContact?.notify) {
+                        senderName = waContact.notify;
+                    }
+                } catch (err) {
+                    // Continue with fallback
+                }
+            }
+            // 5. Final fallback to phone number (not 'Unknown')
+            if (senderName === 'Unknown') {
+                senderName = fromNumber;
             }
         } else if (!isGroup) {
             if (message.key.fromMe) {
@@ -2939,6 +3464,7 @@ async function storeHistorySyncMessage(message, sock, sessionId, contacts = []) 
                 const sessionData = await database.getDataSession(sessionId);
                 fromNumber = sessionData?.phone_number || 'unknown';
                 senderId = fromNumber;
+                senderName = 'You';  // Mark as sent by user
             } else {
                 // Message received from someone else
                 const remoteJidAlt = message.key.remoteJidAlt || message.key.senderPn;
@@ -2950,10 +3476,52 @@ async function storeHistorySyncMessage(message, sock, sessionId, contacts = []) 
                     chatId = remoteJidAlt;
                 }
 
-                // Try to get name from contacts array
-                const contact = contacts.find(c => c.id === message.key.remoteJid || c.id === remoteJidAlt);
-                if (contact) {
-                    senderName = contact.name || contact.notify || senderName;
+                // Try multiple sources to get sender name
+                // 1. First check message.pushName (most reliable for history sync)
+                if (message.pushName) {
+                    senderName = message.pushName;
+                }
+                // 2. Try contacts array from history sync
+                else {
+                    const contact = contacts.find(c => c.id === message.key.remoteJid || c.id === remoteJidAlt);
+                    if (contact?.name) {
+                        senderName = contact.name;
+                    } else if (contact?.notify) {
+                        senderName = contact.notify;
+                    }
+                }
+                // 3. Try socket contacts store
+                if (senderName === 'Unknown' && sock) {
+                    try {
+                        const socketContacts = sock.store?.contacts || {};
+                        const lookupJid = remoteJidAlt || message.key.remoteJid;
+                        const socketContact = socketContacts[lookupJid];
+                        if (socketContact?.name) {
+                            senderName = socketContact.name;
+                        } else if (socketContact?.notify) {
+                            senderName = socketContact.notify;
+                        } else if (socketContact?.verifiedName) {
+                            senderName = socketContact.verifiedName;
+                        }
+                    } catch (err) {
+                        // Continue with fallback
+                    }
+                }
+                // 4. Try onWhatsApp lookup for profile name
+                if (senderName === 'Unknown' && sock) {
+                    try {
+                        const lookupJid = remoteJidAlt || message.key.remoteJid;
+                        const [waContact] = await sock.onWhatsApp(lookupJid);
+                        if (waContact?.notify) {
+                            senderName = waContact.notify;
+                        }
+                    } catch (err) {
+                        // Continue with fallback
+                    }
+                }
+                // 5. Final fallback to phone number
+                if (senderName === 'Unknown') {
+                    senderName = fromNumber;
                 }
             }
         }
@@ -3115,54 +3683,6 @@ async function getChatCounts(sock) {
     }
 }
 
-// Function to sync missed messages when server reconnects
-async function syncMissedMessages(sock) {
-    try {
-        console.log('🔄 Starting missed messages sync...');
-        
-        // Get all chats to check for missed messages
-        const chats = await sock.store?.chats || {};
-        const chatArray = Object.values(chats);
-        
-        let totalMissedMessages = 0;
-        
-        for (const chat of chatArray) {
-            try {
-                // Get messages from the last sync time
-                const messages = await sock.store?.messages?.[chat.id] || {};
-                const messageArray = Object.values(messages);
-                
-                // Filter messages that are newer than last sync time
-                const missedMessages = messageArray.filter(msg => {
-                    const messageTime = Number(msg.messageTimestamp) * 1000;
-                    return messageTime > lastSyncTime;
-                });
-                
-                if (missedMessages.length > 0) {
-                    console.log(`📬 Found ${missedMessages.length} missed messages in chat: ${chat.id}`);
-                    
-                    // Store missed messages in database
-                    for (const message of missedMessages) {
-                        try {
-                            await storeMessageInDatabase(message, sock);
-                            totalMissedMessages++;
-                        } catch (error) {
-                            console.error(`❌ Error storing missed message ${message.key.id}:`, error);
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error(`❌ Error syncing messages for chat ${chat.id}:`, error);
-            }
-        }
-        
-        console.log(`✅ Missed messages sync completed. Found and stored ${totalMissedMessages} missed messages.`);
-        
-    } catch (error) {
-        console.error('❌ Error during missed messages sync:', error);
-    }
-}
-
 // Handle process termination
 process.on('SIGINT', () => {
     console.log('\n\n👋 Shutting down WhatsApp bot...');
@@ -3171,9 +3691,25 @@ process.on('SIGINT', () => {
 
 
 // Start Express server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🌐 Express server running on port ${PORT}`);
     console.log(`📡 Session endpoint: http://localhost:${PORT}/session/:sessionId`);
+    
+    // AUTOMATIC SERVER RECOVERY: Restore all ready sessions on startup
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`🚀 SERVER STARTUP - AUTOMATIC DATA RECOVERY`);
+    console.log(`${'='.repeat(60)}\n`);
+    
+    try {
+        // Restore all previously connected sessions
+        await restoreAllReadySessions();
+        
+        console.log(`${'='.repeat(60)}`);
+        console.log(`✅ SERVER READY - All sessions restored and data recovered`);
+        console.log(`${'='.repeat(60)}\n`);
+    } catch (error) {
+        console.error(`❌ Error during server startup recovery:`, error.message);
+    }
 });
 
 // Function to restore all ready sessions on server startup
@@ -3189,23 +3725,55 @@ async function restoreAllReadySessions() {
             return;
         }
         
-        console.log(`📱 Found ${readySessions.length} ready session(s) to restore`);
+        console.log(`📱 Found ${readySessions.length} ready session(s) to restore\n`);
+        
+        let successCount = 0;
+        let totalChats = 0;
+        let totalMessages = 0;
         
         for (const session of readySessions) {
             try {
                 console.log(`🔄 Restoring session ${session.id} (${session.phone_number})...`);
                 
-                // Start WhatsApp connection for this session
-                await startWhatsAppForSession(session.id);
+                // Get data counts for this session BEFORE restoration
+                const [chatsBefore] = await database.pool.execute(
+                    'SELECT COUNT(*) as count FROM chats WHERE session_id = ?',
+                    [session.id]
+                );
+                const [messagesBefore] = await database.pool.execute(
+                    'SELECT COUNT(*) as count FROM messages WHERE session_id = ?',
+                    [session.id]
+                );
                 
-                console.log(`✅ Session ${session.id} restored successfully`);
+                const chatCountBefore = chatsBefore[0].count;
+                const messageCountBefore = messagesBefore[0].count;
+                
+                // Start WhatsApp connection for this session with forced history sync
+                // forceHistorySync = true clears sync state, like closing/reopening browser
+                await startWhatsAppForSession(session.id, true);
+                
+                successCount++;
+                totalChats += chatCountBefore;
+                totalMessages += messageCountBefore;
+                
+                console.log(`   ✅ Session ${session.id} restored`);
+                console.log(`   📂 Chats recovered: ${chatCountBefore}`);
+                console.log(`   📨 Messages recovered: ${messageCountBefore}\n`);
                 
             } catch (error) {
                 console.error(`❌ Error restoring session ${session.id}:`, error.message);
             }
         }
         
-        console.log('✅ All ready sessions restoration completed');
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`✅ SESSION RESTORATION COMPLETED`);
+        console.log(`${'='.repeat(60)}`);
+        console.log(`   📱 Sessions restored: ${successCount}/${readySessions.length}`);
+        console.log(`   📂 Total chats recovered: ${totalChats}`);
+        console.log(`   📨 Total messages recovered: ${totalMessages}`);
+        console.log(`   💾 All data has been recovered from database`);
+        console.log(`   🔄 History sync will automatically recover any messages since last sync`);
+        console.log(`${'='.repeat(60)}\n`);
         
     } catch (error) {
         console.error('❌ Error restoring ready sessions:', error.message);
@@ -3215,13 +3783,6 @@ async function restoreAllReadySessions() {
 // Start the WhatsApp bot
 console.log('🚀 WhatsApp Bot Server Started...');
 console.log('📱 Create a session using POST /session to generate QR codes\n');
-
-// Restore all ready sessions on startup
-restoreAllReadySessions().then(() => {
-    console.log('🔄 Session restoration process completed');
-}).catch(error => {
-    console.error('❌ Error during session restoration:', error);
-});
 
 // Example: Convert raw QR data to image (uncomment to test)
 // const testQRData = '2@PSZ42LR4Ap/yRLdwqA4E2ef/ns7fXUsauCiTWLXFE1Ke4NSbk7HtA/2N9iQkHLk3jZrXc8JpvyCrrgAXONpOvECAOEFpxqsxHUQ=,A6STEjJNTzhZ5yg4TTZ5cnDepKUtwkAbjPSzZNjxJHU=,E5tSe8rrGBXg2GSDexkfWte2L4OcMia1EHMPKc0r50c=,3OgV9Gzjq+mljWPxgJE16snRS4PJ6NfW5kSqXagRmzA=';

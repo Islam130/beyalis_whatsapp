@@ -130,6 +130,20 @@ class Database {
         return rows[0] || null;
     }
 
+    // Get chat by phone number (to find existing chat with a contact)
+    async getChatByPhoneNumber(phoneNumber, sessionId) {
+        try {
+            const [rows] = await this.pool.execute(
+                'SELECT name FROM chats WHERE phone_number LIKE ? AND session_id = ? LIMIT 1',
+                [`%${phoneNumber}%`, sessionId]
+            );
+            return rows[0] || null;
+        } catch (error) {
+            console.error('Error getting chat by phone number:', error);
+            return null;
+        }
+    }
+
     // Message operations
     async createMessage(messageData) {
         const {
