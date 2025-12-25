@@ -1372,30 +1372,57 @@ async function startWhatsAppForSession(sessionId, forceHistorySync = false) {
         }
     });
 
-    // KEEP-ALIVE MECHANISM: Prevent idle timeout by querying connection every 60 seconds
-    // This keeps the WebSocket alive and prevents automatic logout
+    // KEEP-ALIVE MECHANISM: Prevent idle timeout and verify connection status
+    // This keeps the WebSocket alive, prevents logout, and ensures session status is accurate
     const keepAliveInterval = setInterval(async () => {
         try {
-            // Check if session still exists and is active in database
+            // Check if socket is still connected (readyState 1 = OPEN)
+            const isConnected = sock.user && sock.ws?.readyState === 1;
+
+            // Check if session still exists in database
             const session = await database.getSession(sessionId);
-            
-            if (!session || !session.ready) {
-                console.log(`⚠️ Session ${sessionId} no longer active - stopping keep-alive ping`);
+
+            if (!session) {
+                console.log(`⚠️ Session ${sessionId} not found in database - stopping keep-alive`);
                 clearInterval(keepAliveInterval);
                 sessionSockets.delete(sessionId);
                 return;
             }
-            
-            if (sock.user) {
-                console.log(`💚 Keep-alive ping for session ${sessionId}`);
-                // Query chats list to keep connection active
+
+            if (isConnected) {
+                console.log(`💚 Keep-alive ping for session ${sessionId} - Connection OK`);
+                // Query to keep connection active and prevent WhatsApp logout
                 await sock.fetchPrivacySettings().catch(() => null);
+
+                // Ensure session is marked as ready in database
+                if (!session.ready) {
+                    const phoneNumber = sock.user?.id?.split(':')[0] || session.phone_number;
+                    await database.markSessionReady(sessionId, phoneNumber);
+                    console.log(`✅ Session ${sessionId} marked as ready (connection verified)`);
+                }
+            } else {
+                console.log(`⚠️ Session ${sessionId} connection lost`);
+                // Mark session as not ready if connection is lost
+                if (session.ready) {
+                    await database.pool.execute(
+                        'UPDATE sessions SET ready = 0 WHERE id = ?',
+                        [sessionId]
+                    );
+                    console.log(`📴 Session ${sessionId} marked as not ready`);
+                }
+                // Try to reconnect
+                console.log(`🔄 Attempting to reconnect session ${sessionId}...`);
+                try {
+                    clearInterval(keepAliveInterval);
+                    await startWhatsAppForSession(sessionId);
+                } catch (reconnectError) {
+                    console.log(`❌ Reconnect failed for session ${sessionId}: ${reconnectError.message}`);
+                }
             }
         } catch (error) {
-            // Silently handle keep-alive errors
-            console.log(`⚠️  Keep-alive ping failed for session ${sessionId}: ${error.message}`);
+            console.log(`⚠️ Keep-alive ping failed for session ${sessionId}: ${error.message}`);
         }
-    }, 60000); // Every 60 seconds
+    }, 30000); // Every 30 seconds for faster detection
 
     // Store interval ID for cleanup if needed
     sock.keepAliveInterval = keepAliveInterval;
