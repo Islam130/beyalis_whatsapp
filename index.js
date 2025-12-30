@@ -32,6 +32,7 @@ let lastSyncTime = null;
 let isFirstConnection = true;
 
 
+
 // Function to convert raw WhatsApp QR data to proper QR code image
 async function convertRawQRToImage(rawQRData) {
     try {
@@ -1373,12 +1374,10 @@ async function startWhatsAppForSession(sessionId, forceHistorySync = false) {
     });
 
     // KEEP-ALIVE MECHANISM: Prevent idle timeout and verify connection status
-    // This keeps the WebSocket alive, prevents logout, and ensures session status is accurate
+    // Uses actual API call (fetchPrivacySettings) to test connection
+    // IMPORTANT: Does NOT mark ready=0 on failures - only actual logout events should do that
     const keepAliveInterval = setInterval(async () => {
         try {
-            // Check if socket is still connected (readyState 1 = OPEN)
-            const isConnected = sock.user && sock.ws?.readyState === 1;
-
             // Check if session still exists in database
             const session = await database.getSession(sessionId);
 
@@ -1389,40 +1388,36 @@ async function startWhatsAppForSession(sessionId, forceHistorySync = false) {
                 return;
             }
 
-            if (isConnected) {
+            // Test actual connection by making an API call (not just checking WebSocket state)
+            // This is more reliable than sock.ws?.readyState === 1 which can fail on brief network hiccups
+            try {
+                await sock.fetchPrivacySettings();
                 console.log(`💚 Keep-alive ping for session ${sessionId} - Connection OK`);
-                // Query to keep connection active and prevent WhatsApp logout
-                await sock.fetchPrivacySettings().catch(() => null);
 
-                // Ensure session is marked as ready in database
+                // Ensure session is marked as ready in database (only mark ready, never unmark here)
                 if (!session.ready) {
                     const phoneNumber = sock.user?.id?.split(':')[0] || session.phone_number;
                     await database.markSessionReady(sessionId, phoneNumber);
                     console.log(`✅ Session ${sessionId} marked as ready (connection verified)`);
                 }
-            } else {
-                console.log(`⚠️ Session ${sessionId} connection lost`);
-                // Mark session as not ready if connection is lost
-                if (session.ready) {
-                    await database.pool.execute(
-                        'UPDATE sessions SET ready = 0 WHERE id = ?',
-                        [sessionId]
-                    );
-                    console.log(`📴 Session ${sessionId} marked as not ready`);
-                }
-                // Try to reconnect
-                console.log(`🔄 Attempting to reconnect session ${sessionId}...`);
+            } catch (apiError) {
+                // Connection test failed - log but do NOT mark ready=0
+                // Only actual logout events (in connection.update handler) should mark ready=0
+                console.log(`⚠️ Session ${sessionId} keep-alive failed: ${apiError.message}`);
+                console.log(`⏳ Session ${sessionId} remains ready - waiting for actual logout event`);
+
+                // Try to reconnect silently without changing ready status
                 try {
                     clearInterval(keepAliveInterval);
                     await startWhatsAppForSession(sessionId);
                 } catch (reconnectError) {
-                    console.log(`❌ Reconnect failed for session ${sessionId}: ${reconnectError.message}`);
+                    console.log(`⚠️ Reconnect attempt for session ${sessionId}: ${reconnectError.message}`);
                 }
             }
         } catch (error) {
-            console.log(`⚠️ Keep-alive ping failed for session ${sessionId}: ${error.message}`);
+            console.log(`⚠️ Keep-alive error for session ${sessionId}: ${error.message}`);
         }
-    }, 30000); // Every 30 seconds for faster detection
+    }, 30000); // Every 30 seconds
 
     // Store interval ID for cleanup if needed
     sock.keepAliveInterval = keepAliveInterval;
